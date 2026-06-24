@@ -324,30 +324,55 @@ static int create_archive_from_items(AppState *app, const wchar_t *archive,
 }
 
 static int folder_size_limited(const wchar_t *folder, uint64_t limit, uint64_t *total) {
-    wchar_t pattern[32768];
-    if (!path_join(pattern, ARRAY_LEN(pattern), folder, L"*")) return 0;
-    WIN32_FIND_DATAW data;
-    HANDLE find = FindFirstFileW(pattern, &data);
-    if (find == INVALID_HANDLE_VALUE) return 0;
+    StringList pending;
+    string_list_init(&pending);
+    wchar_t *pattern = (wchar_t *)malloc(32768 * sizeof(wchar_t));
+    wchar_t *child = (wchar_t *)malloc(32768 * sizeof(wchar_t));
     int ok = 1;
-    do {
-        if (!wcscmp(data.cFileName, L".") || !wcscmp(data.cFileName, L"..")) continue;
-        if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-        wchar_t child[32768];
-        if (!path_join(child, ARRAY_LEN(child), folder, data.cFileName)) { ok = 0; break; }
-        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!folder_size_limited(child, limit, total)) { ok = 0; break; }
-        } else {
-            uint64_t size = ((uint64_t)data.nFileSizeHigh << 32) | data.nFileSizeLow;
-            if (*total > limit || size > limit - *total) {
-                *total = limit + 1;
+    if (!pattern || !child || !string_list_add(&pending, folder)) ok = 0;
+
+    while (ok && pending.count && *total <= limit) {
+        wchar_t *current = pending.items[--pending.count];
+        if (!path_join(pattern, 32768, current, L"*")) {
+            free(current);
+            ok = 0;
+            break;
+        }
+        WIN32_FIND_DATAW data;
+        HANDLE find = FindFirstFileW(pattern, &data);
+        if (find == INVALID_HANDLE_VALUE) {
+            free(current);
+            ok = 0;
+            break;
+        }
+        do {
+            if (!wcscmp(data.cFileName, L".") || !wcscmp(data.cFileName, L"..")) continue;
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+            if (!path_join(child, 32768, current, data.cFileName)) {
+                ok = 0;
                 break;
             }
-            *total += size;
-        }
-        if (*total > limit) break;
-    } while (FindNextFileW(find, &data));
-    FindClose(find);
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (!string_list_add(&pending, child)) {
+                    ok = 0;
+                    break;
+                }
+            } else {
+                uint64_t size = ((uint64_t)data.nFileSizeHigh << 32) | data.nFileSizeLow;
+                if (*total > limit || size > limit - *total) {
+                    *total = limit + 1;
+                    break;
+                }
+                *total += size;
+            }
+        } while (*total <= limit && FindNextFileW(find, &data));
+        FindClose(find);
+        free(current);
+    }
+
+    string_list_free(&pending);
+    free(child);
+    free(pattern);
     return ok;
 }
 
