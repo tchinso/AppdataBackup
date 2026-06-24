@@ -41,6 +41,9 @@
 #define IDC_SET_CANCEL      2006
 #define IDC_SET_BANDIZIP    2007
 #define IDC_SET_BROWSE      2008
+#define IDC_SET_LOCAL_EXCLUDE 2009
+
+#define LOCAL_EXCLUDE_CAP 4096
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -60,6 +63,7 @@ typedef struct {
     int stash_level;
     int wiki_level;
     double local_threshold_mib;
+    wchar_t local_excluded_folders[LOCAL_EXCLUDE_CAP];
 } Config;
 
 typedef struct {
@@ -167,6 +171,60 @@ static void string_list_free(StringList *list) {
     for (size_t i = 0; i < list->count; ++i) free(list->items[i]);
     free(list->items);
     memset(list, 0, sizeof(*list));
+}
+
+static int is_exclusion_separator(wchar_t ch) {
+    return ch == L';' || ch == L',' || ch == L'\r' || ch == L'\n';
+}
+
+static int local_folder_is_excluded(const Config *config, const wchar_t *folder_name) {
+    const wchar_t *cursor = config->local_excluded_folders;
+    size_t folder_length = wcslen(folder_name);
+    while (*cursor) {
+        while (*cursor && (is_exclusion_separator(*cursor) || iswspace(*cursor))) ++cursor;
+        const wchar_t *start = cursor;
+        while (*cursor && !is_exclusion_separator(*cursor)) ++cursor;
+        const wchar_t *end = cursor;
+        while (end > start && iswspace(end[-1])) --end;
+        if ((size_t)(end - start) == folder_length &&
+            !_wcsnicmp(start, folder_name, folder_length)) return 1;
+    }
+    return 0;
+}
+
+static int normalize_exclusion_list(const wchar_t *input, wchar_t *output, size_t cap) {
+    const wchar_t *cursor = input;
+    size_t used = 0;
+    while (*cursor) {
+        while (*cursor && (is_exclusion_separator(*cursor) || iswspace(*cursor))) ++cursor;
+        const wchar_t *start = cursor;
+        while (*cursor && !is_exclusion_separator(*cursor)) ++cursor;
+        const wchar_t *end = cursor;
+        while (end > start && iswspace(end[-1])) --end;
+        if (end == start) continue;
+        size_t length = (size_t)(end - start);
+        if (used + (used ? 1 : 0) + length + 1 > cap) return 0;
+        if (used) output[used++] = L';';
+        memcpy(output + used, start, length * sizeof(wchar_t));
+        used += length;
+    }
+    output[used] = 0;
+    return 1;
+}
+
+static void exclusion_list_to_multiline(const wchar_t *input, wchar_t *output, size_t cap) {
+    size_t used = 0;
+    for (const wchar_t *cursor = input; *cursor && used + 1 < cap; ++cursor) {
+        if (is_exclusion_separator(*cursor)) {
+            if (used && output[used - 1] != L'\n' && used + 2 < cap) {
+                output[used++] = L'\r';
+                output[used++] = L'\n';
+            }
+        } else {
+            output[used++] = *cursor;
+        }
+    }
+    output[used] = 0;
 }
 
 static int buffer_reserve(WideBuffer *buffer, size_t needed) {
@@ -395,7 +453,7 @@ static int gather_appdata_items(AppState *app, StringList *items) {
     HANDLE find = FindFirstFileW(pattern, &data);
     if (find == INVALID_HANDLE_VALUE) return items->count > 0;
     uint64_t limit = (uint64_t)(app->config.local_threshold_mib * 1024.0 * 1024.0 + 0.5);
-    size_t included = 0, excluded = 0;
+    size_t included = 0, excluded = 0, excluded_by_setting = 0;
     do {
         if (!wcscmp(data.cFileName, L".") || !wcscmp(data.cFileName, L"..")) continue;
         wchar_t relative[32768], full[32768];
@@ -403,6 +461,11 @@ static int gather_appdata_items(AppState *app, StringList *items) {
         relative[ARRAY_LEN(relative) - 1] = 0;
         path_join(full, ARRAY_LEN(full), local, data.cFileName);
         if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (local_folder_is_excluded(&app->config, data.cFileName)) {
+                ++excluded;
+                ++excluded_by_setting;
+                continue;
+            }
             if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
                 ++excluded;
                 continue;
@@ -419,8 +482,8 @@ static int gather_appdata_items(AppState *app, StringList *items) {
         }
     } while (FindNextFileW(find, &data));
     FindClose(find);
-    log_post(app, L"Local 1차 폴더: %zu개 포함, %zu개 제외 (기준 %.1f MiB)",
-             included, excluded, app->config.local_threshold_mib);
+    log_post(app, L"Local 1차 폴더: %zu개 포함, %zu개 제외 (설정 제외 %zu개, 기준 %.1f MiB)",
+             included, excluded, excluded_by_setting, app->config.local_threshold_mib);
     return items->count > 0;
 }
 
@@ -657,6 +720,8 @@ static void save_config(AppState *app) {
     WritePrivateProfileStringW(L"Compression", L"PersonalWiki", value, app->cfg_path);
     _snwprintf(value, ARRAY_LEN(value), L"%.1f", app->config.local_threshold_mib);
     WritePrivateProfileStringW(L"Appdata", L"LocalThresholdMiB", value, app->cfg_path);
+    WritePrivateProfileStringW(L"Appdata", L"LocalExcludedFolders",
+                               app->config.local_excluded_folders, app->cfg_path);
     WritePrivateProfileStringW(L"Bandizip", L"Path", app->bandizip, app->cfg_path);
 }
 
@@ -669,6 +734,10 @@ static void load_config(AppState *app) {
     wchar_t *end = NULL;
     double parsed = wcstod(threshold, &end);
     app->config.local_threshold_mib = (end != threshold && parsed >= 0.1 && parsed <= 1048576.0) ? parsed : 25.6;
+    GetPrivateProfileStringW(L"Appdata", L"LocalExcludedFolders",
+                             L"ConnectedDevicesPlatform;NVIDIA",
+                             app->config.local_excluded_folders,
+                             ARRAY_LEN(app->config.local_excluded_folders), app->cfg_path);
     GetPrivateProfileStringW(L"Bandizip", L"Path", L"", app->bandizip,
                              ARRAY_LEN(app->bandizip), app->cfg_path);
     if (!file_exists(app->cfg_path)) save_config(app);
@@ -736,7 +805,9 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT message, WPARAM wparam, LP
         make_control(hwnd, L"STATIC", L"Stash 압축", 0, 24, 64, 125, 24, 0, app->font);
         make_control(hwnd, L"STATIC", L"PersonalWiki 압축", 0, 24, 104, 125, 24, 0, app->font);
         make_control(hwnd, L"STATIC", L"Local 폴더 임계값", 0, 24, 153, 145, 24, 0, app->font);
-        make_control(hwnd, L"STATIC", L"Bandizip 경로", 0, 24, 201, 125, 24, 0, app->font);
+        make_control(hwnd, L"STATIC", L"Local 제외 폴더", 0, 24, 193, 145, 24, 0, app->font);
+        make_control(hwnd, L"STATIC", L"(한 줄에 하나)", 0, 24, 217, 125, 24, 0, app->font);
+        make_control(hwnd, L"STATIC", L"Bandizip 경로", 0, 24, 270, 125, 24, 0, app->font);
         HWND combos[3];
         combos[0] = make_control(hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
                                  170, 20, 190, 200, IDC_SET_APPDATA, app->font);
@@ -757,14 +828,20 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT message, WPARAM wparam, LP
         make_control(hwnd, L"EDIT", threshold, WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP,
                      170, 148, 120, 28, IDC_SET_THRESHOLD, app->font);
         make_control(hwnd, L"STATIC", L"MiB", 0, 300, 153, 50, 24, 0, app->font);
+        wchar_t exclusions[LOCAL_EXCLUDE_CAP];
+        exclusion_list_to_multiline(app->config.local_excluded_folders,
+                                    exclusions, ARRAY_LEN(exclusions));
+        make_control(hwnd, L"EDIT", exclusions,
+                     WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP,
+                     170, 188, 190, 64, IDC_SET_LOCAL_EXCLUDE, app->font);
         make_control(hwnd, L"EDIT", app->bandizip, WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP,
-                     24, 229, 276, 28, IDC_SET_BANDIZIP, app->font);
+                     24, 298, 276, 28, IDC_SET_BANDIZIP, app->font);
         make_control(hwnd, L"BUTTON", L"찾아보기", WS_TABSTOP,
-                     308, 227, 76, 31, IDC_SET_BROWSE, app->font);
+                     308, 296, 76, 31, IDC_SET_BROWSE, app->font);
         make_control(hwnd, L"BUTTON", L"저장", BS_DEFPUSHBUTTON | WS_TABSTOP,
-                     194, 282, 90, 32, IDC_SET_SAVE, app->font);
+                     194, 349, 90, 32, IDC_SET_SAVE, app->font);
         make_control(hwnd, L"BUTTON", L"취소", WS_TABSTOP,
-                     294, 282, 90, 32, IDC_SET_CANCEL, app->font);
+                     294, 349, 90, 32, IDC_SET_CANCEL, app->font);
         return 0;
     }
     case WM_COMMAND:
@@ -778,6 +855,15 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT message, WPARAM wparam, LP
                 MessageBoxW(hwnd, L"임계값을 0.1 이상인 MiB 숫자로 입력하세요.", APP_TITLE, MB_OK | MB_ICONWARNING);
                 return 0;
             }
+            wchar_t exclusion_input[LOCAL_EXCLUDE_CAP];
+            wchar_t exclusions[LOCAL_EXCLUDE_CAP];
+            GetWindowTextW(GetDlgItem(hwnd, IDC_SET_LOCAL_EXCLUDE), exclusion_input,
+                           ARRAY_LEN(exclusion_input));
+            if (!normalize_exclusion_list(exclusion_input, exclusions, ARRAY_LEN(exclusions))) {
+                MessageBoxW(hwnd, L"Local 제외 폴더 목록이 너무 깁니다.", APP_TITLE,
+                            MB_OK | MB_ICONWARNING);
+                return 0;
+            }
             wchar_t bandizip[32768];
             GetWindowTextW(GetDlgItem(hwnd, IDC_SET_BANDIZIP), bandizip, ARRAY_LEN(bandizip));
             if (!file_exists(bandizip) || _wcsicmp(file_name_part(bandizip), L"Bandizip.exe")) {
@@ -789,6 +875,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT message, WPARAM wparam, LP
             app->config.stash_level = selection_to_level((int)SendDlgItemMessageW(hwnd, IDC_SET_STASH, CB_GETCURSEL, 0, 0));
             app->config.wiki_level = selection_to_level((int)SendDlgItemMessageW(hwnd, IDC_SET_WIKI, CB_GETCURSEL, 0, 0));
             app->config.local_threshold_mib = value;
+            wcscpy(app->config.local_excluded_folders, exclusions);
             wcscpy(app->bandizip, bandizip);
             save_config(app);
             log_post(app, L"설정을 저장했습니다. (Local 기준 %.1f MiB)", value);
@@ -827,7 +914,7 @@ static void open_settings(AppState *app) {
     }
     HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"AppdataBackupSettings", L"설정",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                                CW_USEDEFAULT, CW_USEDEFAULT, 425, 370,
+                                CW_USEDEFAULT, CW_USEDEFAULT, 425, 440,
                                 app->hwnd, NULL, app->instance, app);
     if (!hwnd) return;
     app->settings_hwnd = hwnd;
