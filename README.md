@@ -9,6 +9,8 @@ Bandizip의 `Bandizip.exe`를 사용해 AppData, `.stash`, `C:\Wiki`를 백업�
 - 백업 종류별로 최근 ZIP 3개만 유지합니다.
 - 복원 시 같은 이름의 파일은 항상 덮어씁니다.
 - 개별 복원은 ZIP을 직접 선택하며, 전부 복원은 종류별 최신 ZIP을 사용합니다.
+- `Bandizip.exe`의 복원 동작에 맞춰 AppData, `.stash`, `C:\Wiki`의 실제 폴더 위치로 복원합니다.
+- `C:\Wiki`가 포함된 작업은 필요할 때 앱 안에서 관리자 권한 재실행을 요청합니다.
 
 Bandizip 설치 경로의 `Bandizip.exe`를 자동 탐색합니다. 설정 창에서 경로를 직접 지정할 수도 있습니다.
 

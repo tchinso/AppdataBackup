@@ -6,15 +6,103 @@
 #endif
 
 #include <windows.h>
+#ifdef __TINYC__
+#define WC_COMBOBOXW L"COMBOBOX"
+#else
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#endif
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
 #include <wctype.h>
+
+#ifdef __TINYC__
+#ifndef TokenElevation
+#define TokenElevation ((TOKEN_INFORMATION_CLASS)20)
+typedef struct _TOKEN_ELEVATION {
+    DWORD TokenIsElevated;
+} TOKEN_ELEVATION;
+#endif
+
+#ifndef OFN_FILEMUSTEXIST
+#define OFN_READONLY        0x00000001
+#define OFN_OVERWRITEPROMPT 0x00000002
+#define OFN_HIDEREADONLY    0x00000004
+#define OFN_NOCHANGEDIR     0x00000008
+#define OFN_SHOWHELP        0x00000010
+#define OFN_ENABLEHOOK      0x00000020
+#define OFN_ENABLETEMPLATE  0x00000040
+#define OFN_ENABLETEMPLATEHANDLE 0x00000080
+#define OFN_NOVALIDATE      0x00000100
+#define OFN_ALLOWMULTISELECT 0x00000200
+#define OFN_EXTENSIONDIFFERENT 0x00000400
+#define OFN_PATHMUSTEXIST   0x00000800
+#define OFN_FILEMUSTEXIST   0x00001000
+#define OFN_CREATEPROMPT    0x00002000
+#define OFN_SHAREAWARE      0x00004000
+#define OFN_NOREADONLYRETURN 0x00008000
+#define OFN_NOTESTFILECREATE 0x00010000
+#define OFN_NONETWORKBUTTON 0x00020000
+#define OFN_NOLONGNAMES     0x00040000
+#define OFN_EXPLORER        0x00080000
+#define OFN_NODEREFERENCELINKS 0x00100000
+#define OFN_LONGNAMES       0x00200000
+#endif
+
+typedef UINT_PTR (CALLBACK *LPOFNHOOKPROC)(HWND, UINT, WPARAM, LPARAM);
+typedef struct tagOFNW {
+    DWORD lStructSize;
+    HWND hwndOwner;
+    HINSTANCE hInstance;
+    LPCWSTR lpstrFilter;
+    LPWSTR lpstrCustomFilter;
+    DWORD nMaxCustFilter;
+    DWORD nFilterIndex;
+    LPWSTR lpstrFile;
+    DWORD nMaxFile;
+    LPWSTR lpstrFileTitle;
+    DWORD nMaxFileTitle;
+    LPCWSTR lpstrInitialDir;
+    LPCWSTR lpstrTitle;
+    DWORD Flags;
+    WORD nFileOffset;
+    WORD nFileExtension;
+    LPCWSTR lpstrDefExt;
+    LPARAM lCustData;
+    LPOFNHOOKPROC lpfnHook;
+    LPCWSTR lpTemplateName;
+    void *pvReserved;
+    DWORD dwReserved;
+    DWORD FlagsEx;
+} OPENFILENAMEW;
+WINBOOL WINAPI GetOpenFileNameW(OPENFILENAMEW *);
+
+typedef struct _SHELLEXECUTEINFOW {
+    DWORD cbSize;
+    ULONG fMask;
+    HWND hwnd;
+    LPCWSTR lpVerb;
+    LPCWSTR lpFile;
+    LPCWSTR lpParameters;
+    LPCWSTR lpDirectory;
+    int nShow;
+    HINSTANCE hInstApp;
+    void *lpIDList;
+    LPCWSTR lpClass;
+    HKEY hkeyClass;
+    DWORD dwHotKey;
+    union {
+        HANDLE hIcon;
+        HANDLE hMonitor;
+    } DUMMYUNIONNAME;
+    HANDLE hProcess;
+} SHELLEXECUTEINFOW;
+WINBOOL WINAPI ShellExecuteExW(SHELLEXECUTEINFOW *);
+#endif
 
 #define APP_TITLE L"Appdata Backup"
 #define CFG_NAME L"AppdataBackup.cfg"
@@ -93,6 +181,7 @@ typedef struct AppState {
     HFONT font;
     volatile LONG busy;
     Config config;
+    wchar_t exe_path[32768];
     wchar_t exe_dir[32768];
     wchar_t cfg_path[32768];
     wchar_t bandizip[32768];
@@ -149,6 +238,38 @@ static int directory_exists(const wchar_t *path) {
     return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+static int process_is_elevated(void) {
+    HANDLE token = NULL;
+    TOKEN_ELEVATION elevation;
+    DWORD size = 0;
+    int elevated = 0;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        if (GetTokenInformation(token, TokenElevation, &elevation,
+                                sizeof(elevation), &size)) {
+            elevated = elevation.TokenIsElevated != 0;
+        }
+        CloseHandle(token);
+    }
+    return elevated;
+}
+
+static int operation_touches_wiki(Operation operation) {
+    return operation == OP_BACKUP_WIKI || operation == OP_RESTORE_WIKI ||
+           operation == OP_BACKUP_ALL || operation == OP_RESTORE_ALL;
+}
+
+static int relaunch_elevated(AppState *app) {
+    SHELLEXECUTEINFOW execute;
+    memset(&execute, 0, sizeof(execute));
+    execute.cbSize = sizeof(execute);
+    execute.hwnd = app->hwnd;
+    execute.lpVerb = L"runas";
+    execute.lpFile = app->exe_path;
+    execute.lpDirectory = app->exe_dir;
+    execute.nShow = SW_SHOWNORMAL;
+    return ShellExecuteExW(&execute) != FALSE;
+}
+
 static void string_list_init(StringList *list) {
     memset(list, 0, sizeof(*list));
 }
@@ -171,6 +292,16 @@ static void string_list_free(StringList *list) {
     for (size_t i = 0; i < list->count; ++i) free(list->items[i]);
     free(list->items);
     memset(list, 0, sizeof(*list));
+}
+
+static void enable_dpi_awareness(void) {
+    typedef WINBOOL (WINAPI *SetProcessDPIAwareProc)(void);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        SetProcessDPIAwareProc set_dpi =
+            (SetProcessDPIAwareProc)GetProcAddress(user32, "SetProcessDPIAware");
+        if (set_dpi) set_dpi();
+    }
 }
 
 static int is_exclusion_separator(wchar_t ch) {
@@ -640,14 +771,22 @@ static int backup_one(AppState *app, const wchar_t *prefix, int level) {
 }
 
 static int restore_one(AppState *app, const wchar_t *prefix, const wchar_t *archive) {
-    wchar_t destination[32768];
+    wchar_t destination[32768], profile[32768];
     if (!_wcsicmp(prefix, L"PersonalWiki")) {
-        wcscpy(destination, L"C:\\");
+        wcscpy(destination, L"C:\\Wiki");
     } else {
-        DWORD got = GetEnvironmentVariableW(L"USERPROFILE", destination, ARRAY_LEN(destination));
+        DWORD got = GetEnvironmentVariableW(L"USERPROFILE", profile, ARRAY_LEN(profile));
         if (!got || got >= ARRAY_LEN(destination)) return 0;
+        if (!_wcsicmp(prefix, L"Appdata")) {
+            if (!path_join(destination, ARRAY_LEN(destination), profile, L"AppData")) return 0;
+        } else if (!_wcsicmp(prefix, L"Stash")) {
+            if (!path_join(destination, ARRAY_LEN(destination), profile, L".stash")) return 0;
+        } else {
+            wcscpy(destination, profile);
+        }
     }
     log_post(app, L"%ls 복원 시작: %ls", prefix, file_name_part(archive));
+    log_post(app, L"%ls 복원 위치: %ls", prefix, destination);
     int ok = run_bz_simple(app, L"x", archive, destination, 1);
     log_post(app, ok ? L"%ls 복원 완료" : L"%ls 복원 실패", prefix);
     return ok;
@@ -964,6 +1103,21 @@ static int choose_archive(AppState *app, const wchar_t *prefix, wchar_t *out, si
 
 static void start_task(AppState *app, Operation operation) {
     if (InterlockedCompareExchange(&app->busy, 0, 0)) return;
+    if (operation_touches_wiki(operation) && !process_is_elevated()) {
+        int answer = MessageBoxW(app->hwnd,
+                                 L"이 작업은 C:\\Wiki에 접근하므로 관리자 권한이 필요할 수 있습니다.\n\n관리자 권한으로 앱을 다시 실행할까요?",
+                                 APP_TITLE, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON1);
+        if (answer == IDYES) {
+            if (relaunch_elevated(app)) {
+                log_post(app, L"관리자 권한으로 다시 실행합니다.");
+                PostMessageW(app->hwnd, WM_CLOSE, 0, 0);
+            } else if (GetLastError() != ERROR_CANCELLED) {
+                MessageBoxW(app->hwnd, L"관리자 권한 재실행을 시작하지 못했습니다.",
+                            APP_TITLE, MB_OK | MB_ICONERROR);
+            }
+        }
+        return;
+    }
     if (!locate_bandizip(app)) {
         MessageBoxW(app->hwnd,
                     L"Bandizip.exe를 찾지 못했습니다.\n\nBandizip을 설치하거나 설정에서 Bandizip.exe 경로를 지정해 주세요.",
@@ -1116,20 +1270,25 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, int show_command) {
     (void)previous;
     (void)command_line;
-    SetProcessDPIAware();
+    enable_dpi_awareness();
+#ifndef __TINYC__
     INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&controls);
+#endif
 
     AppState app;
     memset(&app, 0, sizeof(app));
     app.instance = instance;
-    wchar_t exe_path[32768];
+    wchar_t exe_path[32768], exe_dir[32768];
     DWORD length = GetModuleFileNameW(NULL, exe_path, ARRAY_LEN(exe_path));
     if (!length || length >= ARRAY_LEN(exe_path)) return 1;
-    wchar_t *slash = wcsrchr(exe_path, L'\\');
+    wcscpy(exe_dir, exe_path);
+    wchar_t *slash = wcsrchr(exe_dir, L'\\');
     if (!slash) return 1;
     *slash = 0;
-    wcscpy(app.exe_dir, exe_path);
+    wcsncpy(app.exe_path, exe_path, ARRAY_LEN(app.exe_path) - 1);
+    app.exe_path[ARRAY_LEN(app.exe_path) - 1] = 0;
+    wcscpy(app.exe_dir, exe_dir);
     path_join(app.cfg_path, ARRAY_LEN(app.cfg_path), app.exe_dir, CFG_NAME);
     load_config(&app);
     locate_bandizip(&app);
