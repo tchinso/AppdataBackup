@@ -14,6 +14,14 @@ Bandizip의 `Bandizip.exe`를 사용해 AppData, `.stash`, `C:\Wiki`를 백업�
 
 Bandizip 설치 경로의 `Bandizip.exe`를 자동 탐색합니다. 설정 창에서 경로를 직접 지정할 수도 있습니다.
 
+## 빌드
+
+소스는 `AppdataBackup.cs`입니다. Windows 기본 .NET Framework C# 컴파일러로 빌드합니다.
+
+```powershell
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /platform:x64 /optimize+ /codepage:65001 /out:AppdataBackup.exe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll AppdataBackup.cs
+```
+
 ## 기본 설정
 
 - Appdata: 균형 (4)
